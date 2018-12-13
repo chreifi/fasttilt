@@ -1,0 +1,184 @@
+#!/bin/bash
+
+# removeblankframes
+
+# This script is to be run on a raw tilt-series acquired in SerialEM 
+# using the fast-incremental method described in Chreifi et al. (2018)
+# Rapid Tilt-Series Acquisition for Electron Cryotomography (submitted for publication). 
+
+# Requires a working IMOD installation! (Can be downloaded at https://bio3d.colorado.edu/imod/)
+
+# For ease of use, first place this BASH script in a folder located in your PATH
+# (i.e. /usr/local/bin) and make it an executable (chmod +x removeblankframes).
+# The script can then be executed from the working directory by typing removeblankframes
+# followed by the appropriate flags and inputs (type removeblankframes -h for details)
+
+# The user provides the input tilt-series, highest positive tilt angle, and
+# tilt increment. Optional inputs are binning (default 1), tilt angle 
+# where bidirectional tilt-series meet (if different from 0), and a threshold
+# value for excluding blank frames (default is 3).
+
+# Removeblankframes will run gain normalization and defect correction. It will
+# then run ccderaser to remove deviant pixels before extracting non-blank frames.
+# It will then motion-correct each range of non-blank frames with alignframes and
+# generate a final stack with the correct order of tilts, along with a .rawtlt file
+# containing tilt angle information.
+
+# Note that the current version only works on tilt-series acquired using
+# the bidirectional tilt-scheme.
+
+# Copyright (C) 2018 Georges Chreifi
+# Please credit appropriately. 
+
+####################################################################################
+
+OPTIND=1         # Reset in case getopts has been used previously in the shell.
+cleanup="yes"; incr=1; binning=1; bi=0; threshold=3;
+
+while getopts "h?f:b:t:a:i:T:C" opt; do
+    case "$opt" in
+    h|\? )
+        echo ""
+        echo "USAGE: bash $0 [OPTIONS]"
+        echo ""
+        echo "OPTIONS | DESCRIPTION"
+        echo " -f     | Input bidirectional tilt-series file."
+        echo " -t     | Highest positive tilt angle"
+        echo " -i     | Tilt increment in degrees. Default is 1."
+        echo " -b     | Binning value to be applied (with antialiasing filter). Default is 1."
+        echo " -a     | Optional: Tilt angle where bidirectional tilt-series meet. Default is 0."
+        echo " -T     | Optional: Threshold value (electron counts) for excluding blank frames. Default is 3."
+        echo " -C     | Optional: Use to keep individual extracted files."
+        exit 1                 
+        ;;
+    f )  file=$OPTARG
+        ;;
+    b )  binning=$OPTARG
+        ;;
+    t )  max=$OPTARG
+        ;;
+    a )  bi=$OPTARG
+        ;;
+    i )  incr=$OPTARG
+        ;;
+    T )  threshold=$OPTARG
+        ;;
+    C )  cleanup="no"
+        ;;      
+    esac
+done
+
+shift $((OPTIND-1))
+
+[ "$1" = "--" ] && shift
+
+if [ "$file" = "" ]; then eval ls; echo "Enter file name"; read file; fi
+name=$( echo $file | rev | cut -d "." -f2,3,4,5 | rev )
+
+if [ "$max" = "" ]; then
+    echo "Enter max tilt angle"; read max
+fi
+
+echo "Running removeblankframes..."
+echo ""
+echo "Inputs:"
+echo "File: "$file""
+echo "Binning value: "$binning""
+echo "Highest positive tilt angle: "$max""
+echo "Tilt Increment: "$incr""
+echo "Tilt angle where bidirectional tilt-series meet: "$bi""
+echo "Threshold value: "$threshold""
+echo ""
+
+### Gain-normalization, image flipping, and ccderaser
+defects=$(ls defects*.txt); countref=$(ls *.dm4)
+echo "Gain normalizing raw data..."
+clip norm -B 1 -n 16 -m 2 -D $defects "$file" "$file".norm
+newstack -near -rot -90 -bin "$binning" -AntialiasFilter 6 "$file".norm "$file".norm
+
+rm "$file".norm~
+ccderaser -f -pe 10 -d 8 -gr 4 -s 3 -gi 12 -la 8 -bi 19 -w 2.0 -x 100 -ed 4 -in "$file".norm -outp "$name".st
+
+start2=$( bc -l <<< "$bi + $max")
+start1=$(( $start2 + 1 ))
+end2=$( bc -l <<< "($max * 2 / $incr) + 1"); end2=$(printf "%0.0f" $end2)
+rm -f ranges.log rangeslist.log orderlist.txt orderedlist.txt
+
+### Finding blank frames
+echo "Finding blank frames..."
+rm -f blankframes.log
+clip stats "$name".st | sed 's/(.*)//' | awk '{print ""$1" "$3""}' > stats.log
+head -n -1 stats.log > tmp.log; mv tmp.log stats.log
+sed -i 1,2d stats.log
+start=1; end=$( wc -l < stats.log )
+cp stats.log statslist.log
+while [ "$start" -le "$end" ]; do
+    value=$( sed "1q;d" statslist.log | cut -d " " -f2 )
+    if (( $(echo ""$value" < "$threshold"" | bc -l ) )); then echo ""$start" "$value"" >> blankframes.log; fi
+    sed -i 1d statslist.log
+    start=$(( $start + 1 ))
+done
+rm statslist.log
+
+awk '$1!=p+1{print p+1"-"$1-1}{p=$1}' blankframes.log >> rangeslist.log
+sort -k1 -n -o ranges.log rangeslist.log
+
+echo "Extracting non-blank frames and motion-correcting..."
+mkdir -p 1-extracted 2-aligned
+tilt=$bi
+    while [ "$start1" -le "$end2" ]; do 
+        range=$( sed "1q;d" ranges.log)
+        newstack -fromone -secs "$range" "$name".st "$name"_"$range".st
+        alignframes -gpu 0 -pai -1 -bin 2,1 -ref 5 -radius2 0.125 -sigma2 0.1429 -rrad2 0.167 -hy -in "$name"_"$range".st -ou "$name"_"$range"_af.st 
+        mv "$name"_"$range".st 1-extracted/
+        mv "$name"_"$range"_af.st 2-aligned/
+        echo "$start1 $range $tilt" >> orderlist.txt
+        sed -i 1d ranges.log
+        start1=$(( $start1 + 1 ))
+        tilt=$(( $tilt + $incr ))
+    done
+
+tilt=$(( $bi - $incr ))
+total=$( wc -l < rangeslist.log )
+missing=$( bc -l <<< "$end2 - $total" ); missing=$(printf "%0.0f" $missing)
+diff=$(( $missing + 1 ))
+
+    if [ "$start1" -gt "$end2" ]; then
+        while [ "$start2" -ge "$diff" ]; do
+        range=$( sed "1q;d" ranges.log)
+        newstack -fromone -secs "$range" "$name".st "$name"_"$range".st
+        alignframes -gpu 0 -pai -1 -bin 2,1 -ref 5 -radius2 0.125 -sigma2 0.1429 -rrad2 0.167 -hy -in "$name"_"$range".st -ou "$name"_"$range"_af.st
+        mv "$name"_"$range".st 1-extracted/
+        mv "$name"_"$range"_af.st 2-aligned/
+        echo "$start2 $range $tilt" >> orderlist.txt
+        sed -i 1d ranges.log
+        start2=$(( $start2 - 1 ))
+        tilt=$(( $tilt - $incr ))
+        done
+    fi
+
+sort -k1 -n -o orderedlist.txt orderlist.txt
+cp orderedlist.txt finalorder.txt
+cut -d " " -f3 finalorder.txt > "$name"_af_combined.rawtlt
+
+### Create newstack subscript to generate final ordered stack.
+start=1; end=$( wc -l < orderedlist.txt )
+echo -n "newstack " > 2-aligned/newstack.sh
+while [ "$start" -le "$end" ]; do
+    range=$( sed "1q;d" orderedlist.txt | cut -d " " -f2)
+    echo -n "2-aligned/"$name"_"$range"_af.st " >> 2-aligned/newstack.sh
+    sed -i 1d orderedlist.txt
+    start=$(( $start + 1 ))
+done
+
+echo -n ""$name"_af_combined.st" >> 2-aligned/newstack.sh
+echo "Combining motion-corrected frames into a single stack..."
+bash 2-aligned/newstack.sh
+rm 2-aligned/newstack.sh
+
+echo "Cleaning up files..."
+if [ "$cleanup" = "yes" ]; then
+    rm -rf 1-extracted/ 2-aligned/ ranges.log orderedlist.txt orderlist.txt rangeslist.log blankframes.log
+    rm -f "$name".blk "$name".blk2 "$name".prexf "$name".st "$file".norm 
+fi
+echo "Done!"

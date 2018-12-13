@@ -1,0 +1,715 @@
+#!/bin/bash
+
+# neighbor-enhance
+
+# This script is to be run on a raw tilt-series acquired in SerialEM 
+# using the continuous tilting method described in Chreifi et al. (2018)
+# Rapid Tilt-Series Acquisition for Electron Cryotomography (submitted for publication). 
+
+# Requires a working IMOD installation! (Can be downloaded at https://bio3d.colorado.edu/imod/)
+
+# For ease of use, first place this BASH script in a folder located in your PATH
+# (i.e. /usr/local/bin) and make it an executable (chmod +x neighbor-enhance).
+# The script can then be executed from the working directory by typing neighbor-enhance
+# followed by the appropriate flags and inputs (type neighbor-enhance -h for details)
+
+# The user chooses between unidirectional or bidirectional tilt-series,
+# provides the corresponding input file(s), the total number of frames 
+# in each input tilt-series, the tilt axis rotation angle, highest
+# negative tilt angle, first tilt-angle in the input tilt-series, the
+# tilt increment and an output file name. Optional inputs are binning
+# (default 1), number of the neighbors to include in each set (default 7),
+# and whether to perform gain normalization.
+
+# Neighbor-enhance will first generate stretch references to stretch each
+# neighboring image by an amount equal to the ratio of the cosines of its
+# tilt angle and of the tilt angle of the reference. It will then run ccderaser
+# to remove deviant pixels before extracting sets of reference+neighbors and
+# apply the stretching and motion-correction. Finally, the script will run
+# tiltxcorr to rough-align the high-contrast frames. Output files including
+# the low SNR tilt-series (.st), high SNR neighbor-enhanced tilt-series (.preali),
+# as well as alignment transforms (.prexf and .prexg) will be located in the
+# WORKINGDIRECTORY/etomo/.
+
+# Note that if gain normalization is selected, the script assumes both unflipped/unrotated
+# tilt-series and gain reference. Also note that both gain reference and defects
+# files should be placed in the working directory.
+
+# Copyright (C) 2018 Georges Chreifi
+# Please credit appropriately. 
+
+####################################################################################
+
+OPTIND=1         # Reset in case getopts has been used previously in the shell.
+firstframe=""; inc=""; phi=""; dir=${PWD}; output=""; totalframes=""; inputfile=""; inputfile1=""; inputfile2=""; bin="1"
+gainnorm="0"; firstangle=""; thickness="7"; rot=-90; refdir="01_references"; cleanup="1"
+
+
+while getopts "h?o:f:d:1:2:t:A:S:a:i:b:l:T:R:GC" opt; do
+    case "$opt" in
+    h|\? )
+        echo ""
+        echo "USAGE: bash $0 [OPTIONS]"
+        echo ""
+        echo "OPTIONS | DESCRIPTION"
+        echo " -S     | Enter 1 unidirectional or 2 for bidirectional tilt-series."
+        echo " -f     | Input file for a unidirectional tilt-series."
+        echo " -1     | Input file 1 for a bidirectional tilt-series (negative tilt angle direction). Must also include -2."
+        echo " -2     | Input file 2 for a bidirectional tilt-series (positive tilt angle direction). Must also include -1."
+        echo " -b     | Binning value (with antialiasing filter) to be applied to raw stack before processing."
+        echo " -o     | Output file name. _HC and _LC will automatically be appended to the name."
+        echo " -t     | Total number of frames in each input tilt-series."
+        echo " -A     | Tilt axis rotation angle."
+        echo " -l     | Highest negative tilt angle."
+        echo " -a     | First tilt angle in input tilt-series (frame 1)."
+        echo " -i     | Tilt angle increment."
+        echo " -T     | Optional: Number of neighbors for each stretched and averaged set. Default is 7. Because the reference frame is always in the middle, this value should always be an odd integer."
+        echo " -G     | OptionaL: Choose if you need to apply gain normalization and defect correction. Make sure defects.txt and CountRef.dm4 files are in working directory!"
+        echo " -R     | Optional: Angle by which to rotate all images in the tilt-series (positive for counterclockwise rotation). Default is -90."
+        echo " -d     | Optional: Full path of working directory containing input file(s). Include if different from directory in which you execute this script."
+        echo " -C     | Optional: Do not clean up intermediate files. All files created during processing will be kept."
+        exit 1                 
+        ;;
+    d )  dir=$OPTARG
+        ;;
+    S )  status=$OPTARG
+        ;;
+    o )  output=$OPTARG
+        ;;
+    f )  inputfile=$OPTARG
+        ;;            
+    1 )  inputfile1=$OPTARG
+        ;;
+    2 )  inputfile2=$OPTARG
+        ;;
+    t )  totalframes=$OPTARG
+        ;;
+    A )  phi=$OPTARG
+        ;;  
+    a )  firstframe=$OPTARG
+        ;;
+    l )  firstangle=$OPTARG
+        ;;
+    i )  inc=$OPTARG
+        ;;
+    G )  gainnorm=1
+        ;;
+    b )  bin=$OPTARG
+        ;;
+    T )  thickness=$OPTARG
+        ;;      
+    R )  rot=$OPTARG
+        ;;   
+    C )  cleanup=0
+        ;;                   
+    esac
+done
+
+shift $((OPTIND-1))
+
+[ "$1" = "--" ] && shift
+
+if [ "$status" = "" ]; then echo "Enter 1 for unidirectional tilt-series or 2 for a bidirectional tilt-series, followed by [ENTER]:"; read status; fi
+if [ "$status" -gt 2 ] || [ "$status" -lt 1 ]; then echo "Please enter 1 or 2! For help, type bash $0 -h"; exit 1; fi
+if [ "$inputfile" = "" ] && [ "$inputfile1" = "" ] && [ "$inputfile2" = "" ]; then echo "Need to provide input file(s) correctly!"; exit 1; fi
+if [ "$dir" = "" ]; then echo "Need to provide a working directory! (-d)"; exit 1; fi
+if [ "$output" = "" ]; then echo "Need to provide an output name! (-o)"; exit 1; fi
+if [ "$totalframes" = "" ]; then echo "Need to provide a total number of frames! (-t)"; exit 1; fi
+if [ "$phi" = "" ]; then echo "Need to provide a tilt axis rotation angle! (-A)"; exit 1; fi
+if [ "$firstangle" = "" ]; then echo "Need to provide a highest negative tilt angle! (-a)"; exit 1; fi
+if [ "$firstframe" = "" ]; then echo "Need to provide the first tilt angle in your input file(s)! (-a)"; exit 1; fi
+if [ "$inc" = "" ]; then echo "Need to provide a tilt angle increment! (-i)"; exit 1; fi
+if [ "$bin" -lt "1" ]; then echo "Need to provide a valid value for binning (-b)!"; exit 1; fi
+if [ ! -d "$dir" ]; then echo "Working directory does not exist!"; exit 1; fi
+if [ $status = 1 ]; then echo "Processing unidirectional tilt-series"; echo ""; echo "Inputs:"; echo "$inputfile"; fi
+if [ $status = 2 ]; then echo "Processing bidirectional tilt-series"; echo ""; echo "Inputs:"; echo ""$inputfile1" & "$inputfile2""; fi
+
+echo "Total frames: "$totalframes""
+echo "Tilt axis rotation angle: "$phi""
+echo "Tilt Increment: "$inc""
+echo "Highest negative tilt angle: "$firstangle""
+echo "First tilt angle in input tilt-series: "$firstframe""
+echo "Output file name: "$output""
+echo "Binning value: "$bin""
+cd $dir
+if [ $gainnorm = 1 ]; then 
+    echo "With gain normalization and defects correction"
+    check=$(eval ls *defects*.txt | wc -l); if [ "$check" -ne "1" ]; then echo "Can't find defects.txt file in working directory!"; exit 1; fi
+    check=$(eval ls *.dm4 | wc -l); if [ "$check" -ne "1" ]; then echo "Can't find .dm4 file in working directory!"; exit 1; fi  
+fi
+echo ""
+outputname=$(echo "$output" | rev | cut -f 2- -d '.' | rev )
+outputext=$(echo "$output" | rev | cut -f 1 -d '.' | rev ) 
+padding=$(( ( $thickness - 1 ) / 2 ))
+paddingextract=$(( $padding + 1 ))
+if [ $bin -eq 1 ]; then binnew=4; fi
+if [ $bin -eq 2 ]; then binnew=2; fi
+if [ $bin -gt 2 ]; then binnew=1; fi
+
+if [ "$status" = "1" ]; then
+    mkdir -p $refdir
+    echo "Generating stretch references in stacks of $thickness frames with log file stretchreferences.log"
+    dt=$(date '+%d/%m/%Y %H:%M:%S');
+    echo "$dt - Stretch references" > stretchreferences.log
+    echo "totalframes is $totalframes" >> stretchreferences.log
+    echo "titlaxis angle is $phi" >> stretchreferences.log
+    echo "firstframe is $firstframe" >> stretchreferences.log
+    echo "tilt increment is $inc" >> stretchreferences.log
+
+    # pi calculation for conversion of radians to degrees
+    pi=$(bc -l <<< "4*a(1)")
+    ref=1
+    endmid=$(( $totalframes - $padding ))
+
+    cd $refdir
+
+    # First frames
+    for (( h=$padding; h< (( $padding + $padding )); ++h )); do
+        frame=1
+            for ((i=0; i<="$h"; ++i)); do
+                num1=$(bc -l <<< "($ref* $inc)-($inc)+($firstframe)")
+                rad1=$(bc -l <<< "$num1* ($pi/180)") 
+                cos1=$(bc -l <<< "c($rad1)")
+                num2=$(bc -l <<< "($frame* $inc)-($inc)+($firstframe)")
+                rad2=$(bc -l <<< "$num2* ($pi/180)")
+                cos2=$(bc -l <<< "c($rad2)")
+                num3=$(bc -l <<< "$cos1/ $cos2")
+                output=$( eval "rotmagstr $num3 $phi" )
+                printf -v refwrite "%04d" $ref
+                echo $output >> stretch_$refwrite.xf
+                frame=$(( $frame + 1 ))
+            done
+        echo -ne "Created stretch stack for reference #$ref out of $totalframes\r"
+        ref=$(( $ref + 1 ))
+    done
+
+                    # Middle of the stack
+                    while [ $ref -le $endmid ]; do
+                        frame=$(( $ref - $padding ))
+                        for ((i=1; i<=$thickness; ++i)); do
+                            num1=$(bc -l <<< "($ref* $inc)-($inc)+($firstframe)")
+                            rad1=$(bc -l <<< "$num1* ($pi/180)")
+                            cos1=$(bc -l <<< "c($rad1)")
+                            num2=$(bc -l <<< "($frame* $inc)-($inc)+($firstframe)")
+                            rad2=$(bc -l <<< "$num2* ($pi/180)")
+                            cos2=$(bc -l <<< "c($rad2)")
+                            num3=$(bc -l <<< "$cos1/ $cos2")
+                            output=$( eval "rotmagstr $num3 $phi" )
+                            printf -v refwrite "%04d" $ref
+                            echo $output >> stretch_$refwrite.xf
+                            frame=$(( $frame + 1 ))
+                        done
+                        echo -ne "Created stretch stack for reference #$ref out of $totalframes\r"
+                        ref=$(( $ref + 1 ))
+                    done
+
+    # Last frames
+    for (( j=(( $padding + $padding )); j>$padding; --j )); do
+        frame=$(( $ref - $padding ))
+            for ((i=1; i<="$j"; ++i)); do
+                num1=$(bc -l <<< "($ref* $inc)-($inc)+($firstframe)")
+                rad1=$(bc -l <<< "$num1* ($pi/180)")
+                cos1=$(bc -l <<< "c($rad1)")
+                num2=$(bc -l <<< "($frame* $inc)-($inc)+($firstframe)")
+                rad2=$(bc -l <<< "$num2* ($pi/180)")
+                cos2=$(bc -l <<< "c($rad2)")
+                num3=$(bc -l <<< "$cos1/ $cos2")
+                output=$( eval "rotmagstr $num3 $phi" )
+                printf -v refwrite "%04d" $ref
+                echo $output >> stretch_$refwrite.xf
+                frame=$(( $frame + 1 ))
+            done
+            echo -ne "Created stretch stack for reference #$ref out of $totalframes\r"
+            ref=$(( $ref + 1 ))
+    done
+
+    echo -ne '\n'
+
+    refnum=$(eval ls "$dir"/"$refdir"/*.xf | wc -l)
+    echo "Created stretch stacks for $refnum references" >> stretchreferences.log
+        if [ $refnum -eq $totalframes ]; then
+            echo "Done!"; echo "Done!" >> stretchreferences.log
+        else
+            echo "Failed"; echo "Failed" >> stretchreferences.log; exit 1
+        fi
+
+
+    cd $dir
+
+    stack=$(echo "$inputfile" | rev | cut -f 2- -d '.' | rev )
+    ext=$(echo "$inputfile" | rev | cut -f 1 -d '.' | rev )
+    
+    #gain normalization and defect correction
+    if [ $gainnorm = 1 ]; then 
+        defects=$(eval ls *defects*.txt)
+        countref=$(eval ls *.dm4)
+        dt=$(date '+%d/%m/%Y %H:%M:%S');
+        cliplog="clipnorm"
+        echo "$dt - gain normalization and defect correction" > "$cliplog".log
+        echo "Running gain normalization and defect correction with log file "$cliplog".log..."
+        clip norm -B 1 -n 16 -m 2 -D $defects "$stack".$ext $countref "$stack"_gainnorm.$ext >> "$cliplog".log
+        check=$(eval ls "$stack"_gainnorm.$ext | wc -l); if [ "$check" -ne 1 ]; then echo "clipnorm failed."; echo "clip norm failed." >> "$cliplog".log; exit 1; fi
+        if [ "$bin" -gt "1" ]; then
+            echo "Running newstack to bin original stacks by "$bin"..."
+            newstack -near -rot "$rot" -bin $bin -antialias 6 "$stack"_gainnorm.$ext "$stack"_bin"$bin".st  >> "$cliplog".log
+        else
+            echo "Proceeding without binning raw data."
+            newstack -near -rot "$rot" "$stack"_gainnorm.$ext "$stack"_bin"$bin".st  >> "$cliplog".log 
+        fi
+    fi
+        
+    if [ $gainnorm = 0 ]; then 
+        echo "Proceeding without gain normalization or defect correction."
+        if [ "$bin" -gt "1" ]; then 
+        echo "Running newstack to bin original stacks by "$bin"..."
+        newstack -bin "$bin" -antialias 6 "$stack".$ext "$stack"_bin"$bin".st > bin.log
+        else
+        echo "Proceeding without binning raw data."
+        cp "$stack".$ext "$stack"_bin"$bin".st
+        fi
+    fi
+
+    echo "Running ccderaser..."
+    ccderaser -f -pe 10 -d 8 -gr 4 -s 3 -gi 12 -la 8 -bi 19 -w 2.0 -x 100 -ed 4 -in "$stack"_bin"$bin".st -outp "$stack"_fixed.st > ccderaser.log
+    
+    mkdir -p etomo/
+    cp "$stack"_fixed.st etomo/"$outputname".st
+
+    cd etomo/
+    finalcheck=$(eval ls "$outputname".st | wc -l); if [ "$finalcheck" -eq "1" ]; then echo "Generated "$outputname".st in directory etomo/"; else echo "Something went wrong!"; exit 1; fi
+
+    #neighbor-enhance
+    cd $dir
+    num1=1
+    endmid=$(( $totalframes - $padding ))
+    dt=$(date '+%d/%m/%Y %H:%M:%S')
+    stretchlog="neighbor-enhance"
+    echo "$dt - neighbor-enhance" > "$stretchlog".log
+    echo "input file: "$stack"_fixed.st" >> "$stretchlog".log
+    echo "output file: "$outputname"_HC.st" >> "$stretchlog".log
+    echo "Running neighbor-enhance routine with log file "$stretchlog".log"
+
+    mkdir -p 02_unstretched 03_stretched 04_transforms 05_inversed 06_producta 07_productb 08_newstack 09_averages
+
+    echo "Generating stretched, aligned, and averaged sets..."
+    # First stacks
+    for ((i=0; i<=(( $padding - 1 )); ++i)); do
+        num2=$(( $num1 - $i ))
+        num3=$(( $num1 + $padding ))
+        printf -v num1b "%04d" $num1
+        echo -ne "Working on stack #$num1b...\r"
+        newstack -in "$stack"_fixed.st -fromone -secs "$num2"-"$num3" -ou ./02_unstretched/stack_$num1b.st  >> "$stretchlog".log
+        newstack -in ./02_unstretched/stack_$num1b.st -xform "$dir"/"$refdir"/stretch_$num1b.xf -ou ./03_stretched/stack_$num1b.sst  >> "$stretchlog".log
+        alignframes -pai "$thickness" -in ./03_stretched/stack_$num1b.sst -xfext alixf -nosum  >> "$stretchlog".log
+        mv ./03_stretched/*.alixf 04_transforms/
+        extract=$(sed ""$num1"q;d" ./04_transforms/stack_$num1b.alixf)
+        echo $extract > ./05_inversed/ref_$num1b.xf
+        xfinverse ./05_inversed/ref_$num1b.xf ./05_inversed/refinv_$num1b.xf >> "$stretchlog".log 
+        xfproduct ./04_transforms/stack_$num1b.alixf ./05_inversed/refinv_$num1b.xf ./06_producta/refset_$num1b.alixf >> "$stretchlog".log
+        xfproduct "$dir"/"$refdir"/stretch_$num1b.xf ./06_producta/refset_$num1b.alixf ./07_productb/stretch_$num1b.alixf >> "$stretchlog".log 
+        newstack -in ./02_unstretched/stack_$num1b.st -xform ./07_productb/stretch_$num1b.alixf -ou ./08_newstack/stack2_$num1b.st >> "$stretchlog".log
+        clip average ./08_newstack/stack2_$num1b.st ./09_averages/avg_$num1b.st >> "$stretchlog".log
+        num1=$(( $num1 + 1 ))
+    done
+
+    # Middle of the stack
+    while [ $num1 -le $endmid ]; do
+            num2=$(( $num1 - $padding ))
+            num3=$(( $num1 + $padding ))
+            printf -v num1b "%04d" $num1
+            echo -ne "Working on stack #$num1b...\r"
+            newstack -in "$stack"_fixed.st -fromone -secs "$num2"-"$num3" -ou ./02_unstretched/stack_$num1b.st  >> "$stretchlog".log
+            newstack -in ./02_unstretched/stack_$num1b.st -xform "$dir"/"$refdir"/stretch_$num1b.xf -ou ./03_stretched/stack_$num1b.sst  >> "$stretchlog".log
+            alignframes -pai "$thickness" -in ./03_stretched/stack_$num1b.sst -xfext alixf -nosum  >> "$stretchlog".log
+            mv ./03_stretched/*.alixf 04_transforms/
+            extract=$(sed ""$paddingextract"q;d" ./04_transforms/stack_$num1b.alixf)
+            echo $extract > ./05_inversed/ref_$num1b.xf
+            xfinverse ./05_inversed/ref_$num1b.xf ./05_inversed/refinv_$num1b.xf >> "$stretchlog".log 
+            xfproduct ./04_transforms/stack_$num1b.alixf ./05_inversed/refinv_$num1b.xf ./06_producta/refset_$num1b.alixf >> "$stretchlog".log
+            xfproduct "$dir"/"$refdir"/stretch_$num1b.xf ./06_producta/refset_$num1b.alixf ./07_productb/stretch_$num1b.alixf >> "$stretchlog".log 
+            newstack -in ./02_unstretched/stack_$num1b.st -xform ./07_productb/stretch_$num1b.alixf -ou ./08_newstack/stack2_$num1b.st >> "$stretchlog".log
+            clip average ./08_newstack/stack2_$num1b.st ./09_averages/avg_$num1b.st >> "$stretchlog".log
+            num1=$(( $num1 + 1 ))
+    done
+
+    # Last stacks
+    for ((j=(( $padding - 1 )); j>=0; --j)); do
+        num2=$(( $num1 - $padding ))
+        num3=$(( $num1 + $j ))
+        printf -v num1b "%04d" $num1
+        echo -ne "Working on stack #$num1b...\r"
+        newstack -in "$stack"_fixed.st -fromone -secs "$num2"-"$num3" -ou ./02_unstretched/stack_$num1b.st  >> "$stretchlog".log
+        newstack -in ./02_unstretched/stack_$num1b.st -xform "$dir"/"$refdir"/stretch_$num1b.xf -ou ./03_stretched/stack_$num1b.sst  >> "$stretchlog".log
+        alignframes -pai "$thickness" -in ./03_stretched/stack_$num1b.sst -xfext alixf -nosum  >> "$stretchlog".log
+        mv ./03_stretched/*.alixf 04_transforms/
+        extract=$(sed ""$paddingextract"q;d" ./04_transforms/stack_$num1b.alixf)
+        echo $extract > ./05_inversed/ref_$num1b.xf
+        xfinverse ./05_inversed/ref_$num1b.xf ./05_inversed/refinv_$num1b.xf >> "$stretchlog".log 
+        xfproduct ./04_transforms/stack_$num1b.alixf ./05_inversed/refinv_$num1b.xf ./06_producta/refset_$num1b.alixf >> "$stretchlog".log
+        xfproduct "$dir"/"$refdir"/stretch_$num1b.xf ./06_producta/refset_$num1b.alixf ./07_productb/stretch_$num1b.alixf >> "$stretchlog".log 
+        newstack -in ./02_unstretched/stack_$num1b.st -xform ./07_productb/stretch_$num1b.alixf -ou ./08_newstack/stack2_$num1b.st >> "$stretchlog".log
+        clip average ./08_newstack/stack2_$num1b.st ./09_averages/avg_$num1b.st >> "$stretchlog".log
+        num1=$(( $num1 + 1 ))
+    done
+
+    # generate final aligned, stretched stack:
+    ls ./09_averages/*.st | wc -l >> inputlist.txt
+    for avgs in ./09_averages/*.st;
+    do  
+            echo $avgs >> inputlist.txt
+            echo 0 >> inputlist.txt
+    done
+    echo -ne "\n"
+
+    
+    
+    final=$(eval ls 09_averages/*.st | wc -l)
+    echo "$final" | awk '{print "Created "$1" averaged sets"}'
+
+    echo "Generating full enhanced-contrast stack "$outputname"_HC.st from "$final" averaged sets..."
+    newstack -filei inputlist.txt "$outputname"_HC.st >> "$stretchlog".log
+
+    # cleanup
+    if [ "$cleanup" = "1" ]; then
+    rm -f "$stack"_fixed.$ext
+    rm -f "$stack"_fixed.st
+    rm -rf 02_unstretched 03_stretched 04_transforms 05_inversed 06_producta 07_productb 08_newstack 09_averages
+    rm -f "$stack"_bin"$bin".st
+    rm -rf $refdir
+    rm -f "$stack"_gainnorm.$ext
+    fi
+  
+
+fi    
+
+if [ "$status" = "2" ]; then
+    echo "Generating stretch references in stacks of $thickness frames with log file stretchreferences.log"
+    dt=$(date '+%d/%m/%Y %H:%M:%S');
+    echo "$dt - Stretch references" > stretchreferences.log
+    echo "totalframes is $totalframes" >> stretchreferences.log
+    echo "titlaxis angle is $phi" >> stretchreferences.log
+    echo "firstframe is $firstframe" >> stretchreferences.log
+    echo "tilt increment is $inc" >> stretchreferences.log
+    endmid=$(( $totalframes - $padding ))
+    stretchround=a
+    for (( bi=1; bi<=2; ++bi)); do 
+        cd $dir
+        mkdir -p "$refdir"_$stretchround
+        # pi calculation for conversion of radians to degrees
+        pi=$(bc -l <<< "4*a(1)")
+        ref=1
+
+        cd "$refdir"_$stretchround
+
+        # First frames
+        for (( h=$padding; h< (( $padding + $padding )) ; ++h )); do
+            frame=1
+                for ((i=0; i<="$h"; ++i)); do
+                    num1=$(bc -l <<< "($ref* $inc)-($inc)+($firstframe)")
+                    rad1=$(bc -l <<< "$num1* ($pi/180)")
+                    cos1=$(bc -l <<< "c($rad1)")
+                    num2=$(bc -l <<< "($frame* $inc)-($inc)+($firstframe)")
+                    rad2=$(bc -l <<< "$num2* ($pi/180)")
+                    cos2=$(bc -l <<< "c($rad2)")
+                    num3=$(bc -l <<< "$cos1/ $cos2")
+                    output=$( eval "rotmagstr $num3 $phi" )
+                    printf -v refwrite "%04d" $ref
+                    echo $output >> stretch_$refwrite.xf
+                    frame=$(( $frame + 1 ))
+                done
+            echo -ne "Created stretch stack for reference #$ref out of $totalframes\r"
+            ref=$(( $ref + 1 ))
+        done
+
+                        # Middle of the stack
+                        while [ $ref -le $endmid ]; do
+                            frame=$(( $ref - $padding ))
+                            for ((i=1; i<=$thickness; ++i)); do
+                                num1=$(bc -l <<< "($ref* $inc)-($inc)+($firstframe)")
+                                rad1=$(bc -l <<< "$num1* ($pi/180)")
+                                cos1=$(bc -l <<< "c($rad1)")
+                                num2=$(bc -l <<< "($frame* $inc)-($inc)+($firstframe)")
+                                rad2=$(bc -l <<< "$num2* ($pi/180)")
+                                cos2=$(bc -l <<< "c($rad2)")
+                                num3=$(bc -l <<< "$cos1/ $cos2")
+                                output=$( eval "rotmagstr $num3 $phi" )
+                                printf -v refwrite "%04d" $ref
+                                echo $output >> stretch_$refwrite.xf
+                                frame=$(( $frame + 1 ))
+                            done
+                            echo -ne "Created stretch stack for reference #$ref out of $totalframes\r"
+                            ref=$(( $ref + 1 ))
+                        done
+
+        # Last frames
+        for (( j=(( $padding + $padding )); j>$padding; --j )); do
+            frame=$(( $ref - $padding ))
+                for ((i=1; i<="$j"; ++i)); do
+                    num1=$(bc -l <<< "($ref* $inc)-($inc)+($firstframe)")
+                    rad1=$(bc -l <<< "$num1* ($pi/180)")
+                    cos1=$(bc -l <<< "c($rad1)")
+                    num2=$(bc -l <<< "($frame* $inc)-($inc)+($firstframe)")
+                    rad2=$(bc -l <<< "$num2* ($pi/180)")
+                    cos2=$(bc -l <<< "c($rad2)")
+                    num3=$(bc -l <<< "$cos1/ $cos2")
+                    output=$( eval "rotmagstr $num3 $phi" )
+                    printf -v refwrite "%04d" $ref
+                    echo $output >> stretch_$refwrite.xf
+                    frame=$(( $frame + 1 ))
+                done
+                echo -ne "Created stretch stack for reference #$ref out of $totalframes\r"
+                ref=$(( $ref + 1 ))
+        done
+
+        echo -ne '\n'
+
+        refnum=$(eval ls "$dir"/"$refdir"_$stretchround/*.xf | wc -l)
+        echo "Created stretch stacks for $refnum references in "$refdir"_$stretchround" >> ../stretchreferences.log
+            if [ $refnum -eq $totalframes ]; then
+                echo "Done!"; echo "Done!" >> ../stretchreferences.log
+            else
+                echo "Failed"; echo "Failed" >> ../stretchreferences.log; exit 1
+            fi
+        stretchround=b
+        inc=$(echo "$inc * -1" | bc -l | awk '{printf "%.1f", $0}')
+    done
+
+        cd $dir
+        
+        file1=$(echo "$inputfile1" | rev | cut -f 2- -d '.' | rev )
+        ext1=$(echo "$inputfile1" | rev | cut -f 1 -d '.' | rev ) 
+        file2=$(echo "$inputfile2" | rev | cut -f 2- -d '.' | rev )
+        ext2=$(echo "$inputfile2" | rev | cut -f 1 -d '.' | rev )
+
+        #clipnorm
+        if [ $gainnorm = 1 ]; then 
+            defects=$(eval ls *defects*.txt)
+            countref=$(eval ls *.dm4)
+            dt=$(date '+%d/%m/%Y %H:%M:%S');
+            cliplog="clipnorm"
+            echo "$dt - gain normalization and defect correction" > "$cliplog"1.log
+            echo "$dt - gain normalization and defect correction" > "$cliplog"2.log
+            echo "Running gain normalization and defect correction with log file "$cliplog".log..."
+            clip norm -B 1 -n 16 -m 2 -D $defects "$file1".$ext1 $countref "$file1"_gainnorm.$ext1 >> "$cliplog"1.log
+            clip norm -B 1 -n 16 -m 2 -D $defects "$file2".$ext2 $countref "$file2"_gainnorm.$ext2 >> "$cliplog"2.log
+            wait
+            check=$(eval ls "$file1"_gainnorm.$ext1 | wc -l); if [ "$check" -ne 1 ]; then echo "clipnorm failed."; echo "clip norm failed." >> "$cliplog"1.log; exit 1; fi
+            check=$(eval ls "$file2"_gainnorm.$ext2 | wc -l); if [ "$check" -ne 1 ]; then echo "clipnorm failed."; echo "clip norm failed." >> "$cliplog"2.log; exit 1; fi
+            if [ "$bin" -gt "1" ]; then
+            echo "Running newstack to bin raw stacks by "$bin"..." 
+            newstack -near -rot "$rot" -bin $bin -antialias 6 "$file1"_gainnorm.$ext1 "$file1"_bin"$bin".st  >> "$cliplog"1.log
+            newstack -near -rot "$rot" -bin $bin -antialias 6 "$file2"_gainnorm.$ext2 "$file2"_bin"$bin".st  >> "$cliplog"2.log
+            wait
+            else
+            echo "Proceeding without binning raw data."
+            newstack -near -rot "$rot" "$file1"_gainnorm.$ext1 "$file1"_bin"$bin".st  >> "$cliplog"1.log
+            newstack -near -rot "$rot" "$file2"_gainnorm.$ext2 "$file2"_bin"$bin".st  >> "$cliplog"2.log
+            wait
+            fi
+        fi
+        
+        if [ $gainnorm = 0 ]; then 
+        echo "Proceeding without gain normalization or defect correction."
+            if [ "$bin" -gt "1" ]; then
+                echo "Running newstack to bin raw stacks by "$bin"..."
+                newstack -bin "$bin" -antialias 6 "$file1".$ext1 "$file1"_bin"$bin".st > bin1.log
+                newstack -bin "$bin" -antialias 6 "$file2".$ext2 "$file2"_bin"$bin".st >> bin2.log
+                wait    
+            else
+                echo "Proceeding without binning raw data."
+                cp "$file1".$ext1 "$file1"_bin"$bin".st
+                cp "$file2".$ext2 "$file2"_bin"$bin".st
+                wait
+            fi
+        fi
+
+        echo "Running ccderaser..."
+        ccderaser -f -pe 10 -d 8 -gr 4 -s 3 -gi 12 -la 8 -bi 19 -w 2.0 -x 100 -ed 4 -in "$file1"_bin"$bin".st -outp "$outputname"_1.st > ccderaser.log
+        ccderaser -f -pe 10 -d 8 -gr 4 -s 3 -gi 12 -la 8 -bi 19 -w 2.0 -x 100 -ed 4 -in "$file2"_bin"$bin".st -outp "$outputname"_2.st >> ccderaser.log
+        wait
+        echo "Combining raw bidirectional tilt-series into one stack "$outputname".st"
+        newstack -tw "$outputname"_1.st "$outputname"_2.st "$outputname".st > combinerawts.log
+        mkdir -p etomo/
+        mv "$outputname".st etomo/
+
+        cd etomo/
+        finalcheck=$(eval ls "$outputname".st | wc -l); if [ "$finalcheck" -eq "1" ]; then echo "Generated "$outputname".st in directory etomo/"; else echo "Something went wrong!"; exit 1; fi
+
+        #neighbor-enhance
+        cd $dir
+        endmid=$(( $totalframes - $padding ))
+        dt=$(date '+%d/%m/%Y %H:%M:%S')
+        stretchlog="neighbor-enhance"               
+        echo "$dt - neighbor-enhance" > "$stretchlog".log
+        echo "input files: "$outputname"_1.st "$outputname"_2.st"  >> "$stretchlog".log
+        echo "output file: "$outputname"_HC.st" >> "$stretchlog".log
+        echo "Running neighbor-enhance routine with log file "$stretchlog".log"
+        
+        round=0
+        stretchcount=a
+                
+        echo "Generating stretched, aligned, and averaged sets..."
+        for (( bi=1; bi<=2; ++bi)); do
+                cd $dir
+                num1=1 
+                round=$(( $round + 1 ))
+                mkdir -p round"$round"
+                mv "$outputname"_"$round".st round"$round"/
+                cd round"$round"
+                mkdir -p 02_unstretched 03_stretched 04_transforms 05_inversed 06_producta 07_productb 08_newstack 09_averages
+
+                # First stacks
+                for ((i=0; i<=(( $padding - 1 )); ++i)); do
+                    num2=$(( $num1 - $i ))
+                    num3=$(( $num1 + $padding ))
+                    printf -v num1b "%04d" $num1
+                    echo -ne "Working on stack #$num1b...\r"
+                    newstack -in "$outputname"_"$round".st -fromone -secs "$num2"-"$num3" -ou ./02_unstretched/stack_$num1b.st  >> "$stretchlog".log
+                    newstack -in ./02_unstretched/stack_$num1b.st -xform "$dir"/"$refdir"_"$stretchcount"/stretch_$num1b.xf -ou ./03_stretched/stack_$num1b.sst  >> "$stretchlog".log
+                    alignframes -pai "$thickness" -in ./03_stretched/stack_$num1b.sst -xfext alixf -nosum  >> "$stretchlog".log
+                    mv ./03_stretched/*.alixf 04_transforms/
+                    extract=$(sed ""$num1"q;d" ./04_transforms/stack_$num1b.alixf)
+                    echo $extract > ./05_inversed/ref_$num1b.xf
+                    xfinverse ./05_inversed/ref_$num1b.xf ./05_inversed/refinv_$num1b.xf >> "$stretchlog".log 
+                    xfproduct ./04_transforms/stack_$num1b.alixf ./05_inversed/refinv_$num1b.xf ./06_producta/refset_$num1b.alixf >> "$stretchlog".log
+                    xfproduct "$dir"/"$refdir"_"$stretchcount"/stretch_$num1b.xf ./06_producta/refset_$num1b.alixf ./07_productb/stretch_$num1b.alixf >> "$stretchlog".log 
+                    newstack -in ./02_unstretched/stack_$num1b.st -xform ./07_productb/stretch_$num1b.alixf -ou ./08_newstack/stack2_$num1b.st >> "$stretchlog".log
+                    clip average ./08_newstack/stack2_$num1b.st ./09_averages/avg_$num1b.st >> "$stretchlog".log
+                    num1=$(( $num1 + 1 ))
+                done
+
+                # Middle of the stack
+
+                while [ $num1 -le $endmid ]; do
+                        num2=$(( $num1 - $padding ))
+                        num3=$(( $num1 + $padding ))
+                        printf -v num1b "%04d" $num1
+                        echo -ne "Working on stack #$num1b...\r"
+                        newstack -in "$outputname"_"$round".st -fromone -secs "$num2"-"$num3" -ou ./02_unstretched/stack_$num1b.st  >> "$stretchlog".log
+                        newstack -in ./02_unstretched/stack_$num1b.st -xform "$dir"/"$refdir"_"$stretchcount"/stretch_$num1b.xf -ou ./03_stretched/stack_$num1b.sst  >> "$stretchlog".log
+                        alignframes -pai "$thickness" -in ./03_stretched/stack_$num1b.sst -xfext alixf -nosum  >> "$stretchlog".log
+                        mv ./03_stretched/*.alixf 04_transforms/
+                        extract=$(sed ""$paddingextract"q;d" ./04_transforms/stack_$num1b.alixf)
+                        echo $extract > ./05_inversed/ref_$num1b.xf
+                        xfinverse ./05_inversed/ref_$num1b.xf ./05_inversed/refinv_$num1b.xf >> "$stretchlog".log 
+                        xfproduct ./04_transforms/stack_$num1b.alixf ./05_inversed/refinv_$num1b.xf ./06_producta/refset_$num1b.alixf >> "$stretchlog".log
+                        xfproduct "$dir"/"$refdir"_"$stretchcount"/stretch_$num1b.xf ./06_producta/refset_$num1b.alixf ./07_productb/stretch_$num1b.alixf >> "$stretchlog".log 
+                        newstack -in ./02_unstretched/stack_$num1b.st -xform ./07_productb/stretch_$num1b.alixf -ou ./08_newstack/stack2_$num1b.st >> "$stretchlog".log
+                        clip average ./08_newstack/stack2_$num1b.st ./09_averages/avg_$num1b.st >> "$stretchlog".log
+                        num1=$(( $num1 + 1 ))
+                    done
+
+                # Last stacks
+
+                for ((j=(( $padding - 1 )); j>=0; --j)); do
+                    num2=$(( $num1 - $padding ))
+                    num3=$(( $num1 + $j ))
+                    printf -v num1b "%04d" $num1
+                    echo -ne "Working on stack #$num1b...\r"
+                    newstack -in "$outputname"_"$round".st -fromone -secs "$num2"-"$num3" -ou ./02_unstretched/stack_$num1b.st  >> "$stretchlog".log
+                    newstack -in ./02_unstretched/stack_$num1b.st -xform "$dir"/"$refdir"_"$stretchcount"/stretch_$num1b.xf -ou ./03_stretched/stack_$num1b.sst  >> "$stretchlog".log
+                    alignframes -pai "$thickness" -in ./03_stretched/stack_$num1b.sst -xfext alixf -nosum  >> "$stretchlog".log
+                    mv ./03_stretched/*.alixf 04_transforms/
+                    extract=$(sed ""$paddingextract"q;d" ./04_transforms/stack_$num1b.alixf)
+                    echo $extract > ./05_inversed/ref_$num1b.xf
+                    xfinverse ./05_inversed/ref_$num1b.xf ./05_inversed/refinv_$num1b.xf >> "$stretchlog".log 
+                    xfproduct ./04_transforms/stack_$num1b.alixf ./05_inversed/refinv_$num1b.xf ./06_producta/refset_$num1b.alixf >> "$stretchlog".log
+                    xfproduct "$dir"/"$refdir"_"$stretchcount"/stretch_$num1b.xf ./06_producta/refset_$num1b.alixf ./07_productb/stretch_$num1b.alixf >> "$stretchlog".log 
+                    newstack -in ./02_unstretched/stack_$num1b.st -xform ./07_productb/stretch_$num1b.alixf -ou ./08_newstack/stack2_$num1b.st >> "$stretchlog".log
+                    clip average ./08_newstack/stack2_$num1b.st ./09_averages/avg_$num1b.st >> "$stretchlog".log
+                    num1=$(( $num1 + 1 ))
+                done
+
+                # generate final aligned, stretched stack:
+                ls ./09_averages/*.st | wc -l >> inputlist.txt
+                for avgs in ./09_averages/*.st;
+                do  
+                        echo $avgs >> inputlist.txt
+                        echo 0 >> inputlist.txt
+                done
+                echo -ne "\n"
+
+                final=$(eval ls 09_averages/*.st | wc -l)
+                echo "$final" | awk '{print "Created "$1" averaged sets"}'
+
+                echo "Generating full enhanced-contrast stack "$outputname"_"$round"_HC.st from "$final" averaged sets..."
+                newstack -filei inputlist.txt "$outputname"_"$round"_HC.st >> "$stretchlog".log
+                mv "$outputname"_"$round"_HC.st $dir/
+
+                stretchcount=b
+                cat "$stretchlog".log >> ../"$stretchlog".log
+                rm "$stretchlog".log      
+        done
+
+        cd $dir
+        echo "Combining bidirectional tilt-series stacks into one enhanced-contrast stack "$outputname"_HC.st..."
+        newstack -tw "$outputname"_1_HC.st "$outputname"_2_HC.st "$outputname"_HC.st >> "$stretchlog".log
+
+        finalcheck=$(eval ls "$outputname"_HC.st | wc -l)
+            if [ "$finalcheck" -eq "1" ]; then
+                echo "Successfully ran neighbor-enhance routine and generated "$outputname"_HC.st"
+            else
+                echo "$stretchlog Failed"
+            fi
+            
+            #cleanup
+            cd  $dir
+            if [ "$cleanup" = "1" ]; then
+                rm -rf round1 round2
+                rm -f "$file1"_bin"$bin".st
+                rm -f "$file2"_bin"$bin".st
+                rm -f "$outputname"_1.st "$outputname"_2.st
+                rm -f "$outputname"_1_HC.st "$outputname"_2_HC.st
+                rm -rf "$refdir"_a
+                rm -rf "$refdir"_b
+                rm -f "$file1"_gainnorm.$ext1 "$file2"_gainnorm.$ext2
+                wait
+            fi        
+fi
+
+# Rough alignment routine
+
+dt=$(date '+%d/%m/%Y %H:%M:%S')
+alignlog="roughalign"
+
+cd $dir
+
+echo "Running rough alignment routine with log file "$alignlog".log"
+echo "$dt - rough alignment using tiltxcorr" > "$alignlog".log
+echo "input file: "$outputname"_HC.st" >> "$alignlog".log
+echo "-ro=$phi -f=$firstangle -inc=$inc" >> "$alignlog".log
+echo "output files: "$outputname".prexf "$outputname".prexg "$outputname".preali" >> "$alignlog".log
+
+echo "Calculating cross-correlation and generating coarse aligned stack "$outputname".preali..."
+tiltxcorr -ro $phi -f $firstangle -inc $inc -sigma1 0.03 -radius2 0.25 -sigma2 0.05 "$outputname"_HC.st "$outputname".prexf >> "$alignlog".log
+check=$(eval ls "$outputname".prexf | wc -l)
+if [ "$finalcheck" -ne "1" ]; then echo "tiltxcorr failed"; exit 1; fi
+xftoxg -n 0 "$outputname".prexf >> "$alignlog".log
+if [ $binnew -gt 1 ]; then
+    newstack -fl 2 -bin $binnew -antialias 6 -in "$outputname"_HC.st -xform "$outputname".prexg -ou "$outputname".preali >> "$alignlog".log
+else
+    newstack -fl 2 -in "$outputname"_HC.st -xform "$outputname".prexg -ou "$outputname".preali >> "$alignlog".log
+fi
+
+echo "Finishing up..."
+
+mv "$outputname".prexf etomo/
+mv "$outputname".prexg etomo/
+mv "$outputname".preali etomo/
+
+# cleanup?
+if [ "$cleanup" = "1" ]; then
+echo "Cleaning up..."
+rm "$outputname"_HC.st
+rm -f *_gainnorm."$ext"
+wait
+fi
+
+cd etomo
+finalcheck=$(eval ls *.prexf | wc -l)
+if [ "$finalcheck" -eq "1" ]; then
+    echo "Done!"
+else
+    echo "$alignlog Failed"
+fi 
+
